@@ -17,8 +17,8 @@ This is just Dylan Araps neofetch with as much bloat removed as I can
 
 - Cross platform support
 - Unused features
-- This is made for me and if you don't like it then that sucks
+- This is made for me and if you don't like it then that sucks, feel free to make it work for you though
 
 ## TODO
 
-- Fix the spacing between the logo and the info
+- Fix battery output
