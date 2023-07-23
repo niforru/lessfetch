@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+
+# Based on https://github.com/dylanaraps/lessfetch
+
+version=1.0.0
+
+# Fallback to a value of '5' for shells which support bash
+# but do not set the 'BASH_' shell variables (osh).
+bash_version=${BASH_VERSINFO[0]:-5}
+shopt -s eval_unsafe_arith &>/dev/null
+
+sys_locale=${LANG:-C}
+PATH=$PATH:/usr/xpg4/bin:/usr/sbin:/sbin:/usr/etc:/usr/libexec
+reset='\e[0m'
+shopt -s nocasematch
+
+# Speed up script by not using unicode.
+LC_ALL=C
+LANG=C
+
+get_uptime() {
+    # Get uptime in seconds.
+
+    boot=$(date -d"$(uptime -s)" +%s)
+    now=$(date +%s)
+    s=$((now - boot))
+
+    d="$((s / 60 / 60 / 24)) days"
+    h="$((s / 60 / 60 % 24)) hours"
+    m="$((s / 60 % 60)) mins"
+
+    # Remove plural if < 2.
+    ((${d/ *} == 1)) && d=${d/s}
+    ((${h/ *} == 1)) && h=${h/s}
+    ((${m/ *} == 1)) && m=${m/s}
+
+    # Hide empty fields.
+    ((${d/ *} == 0)) && unset d
+    ((${h/ *} == 0)) && unset h
+    ((${m/ *} == 0)) && unset m
+
+    uptime=${d:+$d, }${h:+$h, }$m
+    uptime=${uptime%', '}
+    uptime=${uptime:-$s seconds}
+
+    # Make the output of uptime smaller.he
+    uptime=${uptime/ seconds/ secs}
+}
+
+get_packages() {
+    # to adjust the number of pkgs per pkg manager
+    pkgs_h=0
+
+    # has: Check if package manager installed.
+    # dir: Count files or dirs in a glob.
+    # pac: If packages > 0, log package manager name.
+    # tot: Count lines in command output.
+    has() { type -p "$1" >/dev/null && manager=$1; }
+    # globbing is intentional here
+    # shellcheck disable=SC2206
+    dir() { pkgs=($@); ((packages+=${#pkgs[@]})); pac "$((${#pkgs[@]}-pkgs_h))"; }
+    pac() { (($1 > 0)) && { managers+=("$1 (${manager})"); manager_string+="${manager}, "; }; }
+    tot() {
+        IFS=$'\n' read -d "" -ra pkgs <<< "$("$@")";
+        ((packages+=${#pkgs[@]}));
+        pac "$((${#pkgs[@]}-pkgs_h))";
+    }
+
+
+    has pacman-key && tot pacman -Qq --color never
+    has pacstall   && tot pacstall -L
+
+    # 'mine' conflicts with minesweeper games.
+    [[ -f /etc/SDE-VERSION ]] &&
+        has mine && tot mine -q
+
+
+    printf -v packages '%s, ' "${managers[@]}"
+    packages=${packages%,*}
+
+    packages=${packages/pacman-key/pacman}
+}
+
+get_shell() {
+    shell="${SHELL##*/} "
+
+    [[ $BASH_VERSION ]] ||
+        BASH_VERSION=$("$SHELL" -c "printf %s \"\$BASH_VERSION\"")
+
+    shell+=${BASH_VERSION/-*}
+
+    # Remove unwanted info.
+    shell=${shell/options*}
+    shell=${shell/\(*\)}
+}
+
+get_cpu() {
+
+    # Get CPU name.
+    cpu_file="/proc/cpuinfo"
+    cpu="$(awk -F '\\s*: | @' \
+            '/model name|Hardware|Processor|^cpu model|chip type|^cpu type/ {
+            cpu=$2; if ($1 == "Hardware") exit } END { print cpu }' "$cpu_file")"
+
+
+    speed_dir="/sys/devices/system/cpu/cpu0/cpufreq"
+
+    # Select the right temperature file.
+    for temp_dir in /sys/class/hwmon/*; do
+        [[ "$(< "${temp_dir}/name")" =~ (cpu_thermal|coretemp|fam15h_power|k10temp) ]] && {
+            temp_dirs=("$temp_dir"/temp*_input)
+            temp_dir=${temp_dirs[0]}
+            break
+        }
+    done
+
+    # Get CPU speed.
+
+    speed="$(< "${speed_dir}/${bios_limit}")" ||\
+    speed="$(< "${speed_dir}/scaling_max_freq")" ||\
+    speed="$(< "${speed_dir}/cpuinfo_max_freq")"
+    speed="$((speed / 1000))"
+
+    # Get CPU temp.
+    [[ -f "$temp_dir" ]] && deg="$(($(< "$temp_dir") * 100 / 10000))"
+
+    # Get CPU cores.
+    cores="$(grep -c "^processor" "$cpu_file")"
+
+    # Remove un-needed patterns from cpu output.
+    cpu="${cpu//(TM)}"
+    cpu="${cpu//(tm)}"
+    cpu="${cpu//(R)}"
+    cpu="${cpu//(r)}"
+
+    # Trim spaces from core and speed output
+    cores="${cores//[[:space:]]}"
+    speed="${speed//[[:space:]]}"
+
+    # Add CPU cores to the output.
+    [[ "$cpu_cores" != "off" && "$cores" ]] && \
+
+    cpu="$cpu ($cores)"
+
+    # Add CPU speed to the output.
+    speed="${speed:0:1}.${speed:1}"
+    cpu="$cpu @ ${speed}GHz"
+
+
+    # Add CPU temp to the output.
+    deg="${deg//.}"
+
+    # Format the output
+    deg="[${deg/${deg: -1}}.${deg: -1}°${cpu_temp:-C}]"
+    cpu="$cpu $deg"
+
+}
+
+get_memory() {
+    # MemUsed = Memtotal + Shmem - MemFree - Buffers - Cached - SReclaimable
+    # Source: https://github.com/KittyKatt/screenFetch/issues/386#issuecomment-249312716
+    while IFS=":" read -r a b; do
+        case $a in
+            "MemTotal") ((mem_used+=${b/kB})); mem_total="${b/kB}" ;;
+            "MemFree" | "Buffers" | "Cached" | "SReclaimable")
+                mem_used="$((mem_used-=${b/kB}))"
+            ;;
+        esac
+    done < /proc/meminfo
+
+    mem_used="$((mem_used / 1024))"
+
+    mem_total="$((mem_total / 1024))"
+    
+    mem_perc=$((mem_used * 100 / mem_total))
+
+    mem_used=$(awk '{printf "%.2f", $1 / $2}' <<< "$mem_used 1024")
+    mem_total=$(awk '{printf "%.2f", $1 / $2}' <<< "$mem_total 1024")
+    mem_label=GiB
+
+    memory="${mem_used}${mem_label:-MiB} / ${mem_total}${mem_label:-MiB} ${mem_perc:+(${mem_perc}%)}"
+}
+
+get_disk() {
+    disk_show=('/')
+
+    type -p df &>/dev/null ||
+        { err "Disk requires 'df' to function. Install 'df' to get disk info."; return; }
+
+    df_version=$(df --version 2>&1)
+    df_flags=(-P -h)
+
+    # Create an array called 'disks' where each element is a separate line from
+    # df's output. We then unset the first element which removes the column titles.
+    IFS=$'\n' read -d "" -ra disks <<< "$(df "${df_flags[@]}" "${disk_show[@]:-/}")"
+    unset "disks[0]"
+
+    for disk in "${disks[@]}"; do
+        # Create a second array and make each element split at whitespace this time.
+        IFS=" " read -ra disk_info <<< "$disk"
+        disk_perc=${disk_info[${#disk_info[@]} - 2]/\%}
+
+        # Both have to be enable for whatever reason don't change
+        case $df_version in
+            *befhikm*)
+                disk=$((disk_info[${#disk_info[@]} - 4] / 1024 / 1024))G
+                disk+=" / "
+                disk+=$((disk_info[${#disk_info[@]} - 5] / 1024/ 1024))G
+                disk+=${disk_perc:+ ($disk_perc%)}
+            ;;
+
+            *)
+                disk=${disk_info[${#disk_info[@]} - 4]/i}
+                disk+=" / "
+                disk+=${disk_info[${#disk_info[@]} - 5]/i}
+                disk+=${disk_perc:+ ($disk_perc%)}
+            ;;
+        esac
+
+        disk_sub=${disk_info[*]::${#disk_info[@]} - 5}
+
+        # Append '(disk mount point)' to the subtitle.
+        prin "$subtitle${disk_sub:+ ($disk_sub)}" "$disk"
+
+    done
+}
+
+get_battery() {
+    battery_info=$(acpi -b)
+    battery_info="${battery_info//(: Battery 0:)}"
+    prin "" "$battery_info"
+}
+
+get_cols() {
+    local blocks blocks2 cols
+
+    block_range=(0 15)
+    block_width=3
+    block_height=1
+
+    # Convert the width to space chars.
+    printf -v block_width "%${block_width}s"
+
+    # Generate the string.
+    for ((block_range[0]; block_range[0]<=block_range[1]; block_range[0]++)); do
+        case ${block_range[0]} in
+            [0-7])
+                printf -v blocks  '%b\e[3%bm\e[4%bm%b' \
+                    "$blocks" "${block_range[0]}" "${block_range[0]}" "$block_width"
+            ;;
+
+            *)
+                printf -v blocks2 '%b\e[38;5;%bm\e[48;5;%bm%b' \
+                    "$blocks2" "${block_range[0]}" "${block_range[0]}" "$block_width"
+            ;;
+        esac
+    done
+
+    # Convert height into spaces.
+    printf -v block_spaces "%${block_height}s"
+
+    # Convert the spaces into rows of blocks.
+    [[ "$blocks"  ]] && cols+="${block_spaces// /${blocks}[mnl}"
+    [[ "$blocks2" ]] && cols+="${block_spaces// /${blocks2}[mnl}"
+
+    # Add newlines to the string.
+    cols=${cols%%nl}
+    cols=${cols//nl/
+[${text_padding}C${zws}}
+
+    # Add block height to info height.
+    ((info_height+=block_range[1]>7?block_height+2:block_height+1))
+
+    printf '\n\e[%bC%b\n' "$text_padding" "${zws}${cols}"
+
+    unset -v blocks blocks2 cols
+
+    # Tell info() that we printed manually.
+    prin=1
+}
+
+# IMAGES
+
+get_window_size() {
+    # This functions gets the current window size in
+    # pixels.
+    #
+    # We first try to use the escape sequence "\033[14t"
+    # to get the terminal window size in pixels. If this
+    # fails we then fallback to using "xdotool" or other
+    # programs.
+
+    # Tmux has a special way of reading escape sequences
+    # so we have to use a slightly different sequence to
+    # get the terminal size.
+
+    case ${TMUX:-null} in
+        "null") printf '%b' '\e[14t' ;;
+        *)      printf '%b' '\ePtmux;\e\e[14t\e\\ ' ;;
+    esac
+
+    # The escape codes above print the desired output as
+    # user input so we have to use read to store the out
+    # -put as a variable.
+    # The 1 second timeout is required for older bash
+    #
+    # False positive.
+    # shellcheck disable=2141
+    IFS=';t' read -d t -t 0.05 -sra term_size
+    unset IFS
+
+    term_height="${term_size[1]}"
+    term_width="${term_size[2]}"
+
+    # Get terminal width/height.
+    current_window="$(xdo id)"
+
+    # If the ID was found get the window size.
+    if [[ "$current_window" ]]; then
+        term_size=("$(xwininfo -id "$current_window")")
+        term_width="${term_size[0]#*Width: }"
+        term_width="${term_width/$'\n'*}"
+        term_height="${term_size[0]/*Height: }"
+        term_height="${term_height/$'\n'*}"
+    fi
+
+
+    term_width="${term_width:-0}"
+}
+
+
+get_term_size() {
+    # Get the terminal size in cells.
+    read -r lines columns <<< "$(stty size)"
+
+    # Calculate font size.
+    font_width="$((term_width / columns))"
+    font_height="$((term_height / lines))"
+}
+
+# TEXT FORMATTING
+
+info() {
+    # Save subtitle value.
+    [[ "$2" ]] && subtitle="$1"
+
+    # Make sure that $prin is unset.
+    unset -v prin
+
+    # Call the function.
+    "get_${2:-$1}"
+
+    # If the get_func function called 'prin' directly, stop here.
+    [[ "$prin" ]] && return
+
+    # Update the variable.
+    if [[ "$2" ]]; then
+        output="$(trim "${!2}")"
+    else
+        output="$(trim "${!1}")"
+    fi
+
+    if [[ "$2" && "${output// }" ]]; then
+        prin "$1" "$output"
+
+    elif [[ "${output// }" ]]; then
+        prin "$output"
+    fi
+
+    unset -v subtitle
+}
+
+prin() {
+
+    separator=":"
+
+    # If $2 doesn't exist we format $1 as info.
+    [[ "$json" ]] && { printf '    %s\n' "\"${1}\": \"${2}\","; return; }
+
+    string="${1}${2:+: $2}"
+
+    string="$(trim "${string//$'\e[0m'}")"
+    length="$(strip_sequences "$string")"
+    length="${#length}"
+
+    # Format the output.
+    string="${string/:/${reset}${colon_color}${separator:=:}${info_color}}"
+    string="${subtitle_color}${bold}${string}"
+
+    # Print the info.
+    printf '%b\n' "${text_padding:+\e[${text_padding}C}${zws}${string//\\n}${reset} "
+
+    # Calculate info height.
+    ((++info_height))
+
+    # Log that prin was used.
+    prin=1
+}
+
+
+trim() {
+    set -f
+    # shellcheck disable=2048,2086
+    set -- $*
+    printf '%s\n' "${*//[[:space:]]/}"
+    set +f
+}
+
+trim_quotes() {
+    trim_output="${1//\'}"
+    trim_output="${trim_output//\"}"
+    printf "%s" "$trim_output"
+}
+
+strip_sequences() {
+    strip="${1//$'\e['3[0-9]m}"
+    strip="${strip//$'\e['[0-9]m}"
+    strip="${strip//\\e\[[0-9]m}"
+    strip="${strip//$'\e['38\;5\;[0-9]m}"
+    strip="${strip//$'\e['38\;5\;[0-9][0-9]m}"
+    strip="${strip//$'\e['38\;5\;[0-9][0-9][0-9]m}"
+
+    printf '%s\n' "$strip"
+}
+
+# COLORS
+
+colors=(distro)
+
+set_colors() {
+    set_text_colors "$@"
+}
+
+set_text_colors() {
+    at_color="$reset"
+    subtitle_color="$(color "$2")"
+    colon_color="$reset"
+    info_color="$reset"
+}
+
+color() {
+    case $1 in
+        [0-6])    printf '%b\e[3%sm'   "$reset" "$1" ;;
+        7 | "fg") printf '\e[37m%b'    "$reset" ;;
+        *)        printf '\e[38;5;%bm' "$1" ;;
+    esac
+}
+
+# OTHER
+
+stdout() {
+    unset subtitle_color colon_color info_color bold at_color \
+          text_padding zws reset color_blocks \
+          c1 c2 c3 c4 c5 c6 c7 c8
+}
+
+err() {
+    err+="$(color 1)[!]${reset} $1"
+}
+
+get_full_path() {
+    # This function finds the absolute path from a relative one.
+    # For example "Pictures/Wallpapers" --> "/home/dylan/Pictures/Wallpapers"
+
+    # If the file exists in the current directory, stop here.
+    [[ -f "${PWD}/${1}" ]] && { printf '%s\n' "${PWD}/${1}"; return; }
+
+    local full_dir="${1##*/}"
+
+    # Iterate down a (possible) chain of symlinks.
+    while [[ -L "$full_dir" ]]; do
+        full_dir="$(readlink "$full_dir")"
+        cd "${full_dir%/*}" || exit
+        full_dir="${full_dir##*/}"
+    done
+
+    # Final directory.
+    full_dir="$(pwd -P)/${1/*\/}"
+
+    [[ -e "$full_dir" ]] && printf '%s\n' "$full_dir"
+}
+
+cache() {
+    if [[ "$2" ]]; then
+        mkdir -p "${cache_dir}/lessfetch"
+        printf "%s" "${1/*-}=\"$2\"" > "${cache_dir}/lessfetch/${1/*-}"
+    fi
+}
+
+term_padding() {
+    # Get terminal padding to properly align cursor.
+    [[ -z "$term" ]] && get_term
+
+    case $term in
+        urxvt*|rxvt-unicode)
+            [[ $xrdb ]] || xrdb=$(xrdb -query)
+
+            [[ $xrdb != *internalBorder:* ]] &&
+                return
+
+            padding=${xrdb/*internalBorder:}
+            padding=${padding/$'\n'*}
+
+            [[ $padding =~ ^[0-9]+$ ]] ||
+                padding=
+        ;;
+    esac
+}
+
+dynamic_prompt() {
+    printf -v nlines "%${lines}s"
+    printf "%b" "${nlines// /\\n}"
+}
+
+cache_uname() {
+    # Cache the output of uname so we don't
+    # have to spawn it multiple times.
+    IFS=" " read -ra uname <<< "$(uname -srm)"
+
+    kernel_name="${uname[0]}"
+    kernel_version="${uname[1]}"
+    kernel_machine="${uname[2]}"
+}
+
+get_ppid() {
+    # Get parent process ID of PID.
+    ppid="$(grep -i -F "PPid:" "/proc/${1:-$PPID}/status")"
+    ppid="$(trim "${ppid/PPid:}")"
+
+    printf "%s" "$ppid"
+}
+
+get_process_name() {
+    # Get PID name.
+    name="$(< "/proc/${1:-$PPID}/comm")"
+
+    printf "%s" "$name"
+}
+
+# FINISH UP
+
+get_simple() {
+    while [[ "$1" ]]; do
+        [[ "$(type -t "get_$1")" == "function" ]] && {
+            stdout
+            simple=1
+            info "$1" "$1"
+        }
+        shift
+    done
+    ((simple)) && exit
+}
+
+print_info() {
+    info "OS" distro
+    info "Host" model
+    info "Kernel" kernel
+    info "Uptime" uptime
+    info "Packages" packages
+    info "Shell" shell
+    info "Resolution" resolution
+    info "WM" wm
+    info "Terminal" term
+    info "CPU" cpu
+    info "GPU" gpu
+    info "Memory" memory
+    info "Disk" disk
+    info "Battery" battery
+
+    info cols
+}
+get_all() {
+    distro="Arch Linux x86_64"
+    model="VivoBook_ASUSLaptop X513EAN_F513EA 1.0"
+    wm="dwm"
+    kernel="$kernel_name $kernel_version" 
+    resolution="1920x1080 @ 60.06Hz"
+    term="st"
+    gpu="Intel TigerLake-LP GT2 [Iris Xe Graphics]"
+}
+
+main() {
+    get_all
+    cache_uname
+
+    bold='\e[1m'
+    set_colors 6 6 7 1
+    [[ $verbose != on ]] && exec 2>/dev/null
+    get_simple "$@"
+
+    # If the script exits for any reason, unhide the cursor.
+    trap 'printf "\e[?25h\e[?7h"' EXIT
+
+    # Hide the cursor and disable line wrap.
+    printf '\e[?25l\e[?7l'
+
+    cache_dir="/tmp"
+    print_info
+    dynamic_prompt
+
+    # Add lessfetch info to verbose output.
+    err "lessfetch command: $0 $*"
+    err "lessfetch version: $version"
+
+    [[ $verbose == on ]] && printf '%b\033[m' "$err" >&2
+
+    return 0
+}
+
+main "$@"
