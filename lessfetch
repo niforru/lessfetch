@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Based on https://github.com/dylanaraps/lessfetch
+# Based on https://github.com/dylanaraps/neofetch
 
 version=1.0.0
 
